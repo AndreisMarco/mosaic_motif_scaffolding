@@ -6,7 +6,7 @@ from mosaic.structure_prediction import (
 from mosaic.losses.structure_prediction import IPTMLoss
 from mosaic.common import tokenize
 from mosaic.alphafold.common import residue_constants, protein
-from mosaic.alphafold.model import config, data, modules_multimer
+from mosaic.alphafold.model import config, data, modules_multimer, modules, state
 from mosaic.losses.confidence_metrics import confidence_metrics, _calculate_bin_centers
 
 
@@ -60,10 +60,11 @@ class AFOutput(eqx.Module):
     predicted_lddt_logits: Float[Array, "N 50"]
     plddt: Float[Array, "N"]
     structure_module: StructureModuleOutputs
-    recycling_state: modules_multimer.AlphaFoldState
+    recycling_state: state.AlphaFoldState
 
 
-def load_af2(data_dir: str = "."):
+def load_af2(data_dir: str = ".", multimer=True):
+
     if not (Path(data_dir) / "params").exists():
         print(
             f"Could not find AF2 parameters in {data_dir}/params. \n Running `download_params.sh .`"
@@ -77,7 +78,7 @@ def load_af2(data_dir: str = "."):
         model_params = [
             data.get_model_haiku_params(model_name=model_name, data_dir=data_dir)
             for model_name in tqdm(
-                [f"model_{i}_multimer_v3" for i in range(1, 6)],
+                [f"model_{i}_{'multimer_v3' if multimer else 'ptm'}" for i in range(1, 6 if multimer else 3)],
                 desc="Loading AF2 params",
             )
         ]
@@ -85,7 +86,9 @@ def load_af2(data_dir: str = "."):
         raise FileNotFoundError(
             f"Could not find AF2 parameters in {data_dir}/params. \n Run `download_params.sh .`. \n {e}"
         )
-    cfg = config.model_config("model_1_multimer_v3")
+    stacked_model_params = tree.map(lambda *v: np.stack(v), *model_params)
+
+    cfg = config.model_config("model_1_multimer_v3" if multimer else "model_1_ptm")
     cfg.max_msa_clusters = 1
     cfg.max_extra_msa = 1
     cfg.masked_msa_replace_fraction = 0
@@ -96,23 +99,24 @@ def load_af2(data_dir: str = "."):
     cfg.model.global_config.deterministic = True
     cfg.model.global_config.use_remat = True
     cfg.model.num_extra_msa = 1
+    cfg.model.resample_msa_in_recycling = False
 
-    # haiku transform forward function
+    #haiku transform forward function
+    init_model = modules_multimer.AlphaFold if multimer else modules.AlphaFold
     def _forward_fn(
         features: dict,
-        previous_rep: modules_multimer.AlphaFoldState,
+        previous_rep: state.AlphaFoldState,
         use_dropout=False,
         **kwargs,
     ) -> AFOutput:
         print("JIT compiling AF2...")
-        model = modules_multimer.AlphaFold(cfg.model)
+        model = init_model(cfg.model)
         prediction_results, state = model(
             batch=features,
             prev_rep=previous_rep,
             use_dropout=use_dropout,
             **kwargs,
         )
-        # add confidences
         confidences = confidence_metrics(prediction_results)
         return AFOutput(
             distogram=Distogram(**prediction_results["distogram"]),
@@ -136,9 +140,6 @@ def load_af2(data_dir: str = "."):
         )
 
     transformed = hk.transform(_forward_fn)
-
-    stacked_model_params = tree.map(lambda *v: np.stack(v), *model_params)
-
     return (transformed.apply, stacked_model_params)
 
 
@@ -169,8 +170,29 @@ def _initial_guess(st: gemmi.Structure):
     ]
     return initial_guess_all_atoms
 
+def multimer_to_monomer_features(features: dict):
 
-def set_binder_sequence(PSSM, features: dict):
+    monomer_features = {}
+    has_break = jnp.concatenate([jnp.array([0]), jnp.diff(features['asym_id'])])
+#    between_segment_residues = jnp.where(has_break, 1, 0) #this doesnt seem to matter much
+    between_segment_residues = np.zeros(features['asym_id'].shape, dtype=int)
+    target_feat = jnp.concatenate([
+        between_segment_residues[:, None],
+        jax.nn.one_hot(features['aatype'], 21)
+        ], axis=-1)
+    monomer_features['target_feat'] = target_feat
+    monomer_features['residue_index'] = jnp.cumsum(has_break)*50 + jnp.arange(features['asym_id'].size)
+    monomer_features['template_all_atom_masks'] = features['template_all_atom_mask']
+    monomer_features['template_mask'] = np.ones(1)
+
+    monomer_features['template_pseudo_beta'], monomer_features['template_pseudo_beta_mask'] = jax.vmap(modules.pseudo_beta_fn)(
+        features['template_aatype'], features['template_all_atom_positions'], features['template_all_atom_mask']
+        )
+
+    return features | monomer_features
+
+
+def set_binder_sequence(PSSM, features: dict, multimer: bool=True):
     if PSSM is None:
         PSSM = jnp.zeros((0, 20))
     assert PSSM.shape[-1] == 20
@@ -200,11 +222,15 @@ def set_binder_sequence(PSSM, features: dict):
         .set(hard_pssm)
     )
 
-    return features | {
+    out = features | {
         "msa_feat": msa_feat,
         "target_feat": soft_sequence,
         "aatype": jnp.argmax(soft_sequence, axis=-1),
     }
+    
+    if not multimer:
+        return multimer_to_monomer_features(out)
+    return out
 
 
 @dataclass
@@ -317,7 +343,7 @@ def make_af_features(chains: list[TargetChain]) -> dict[str, jax.Array]:
         "target_feat": np.zeros((L, 20)),
         "msa_feat": np.zeros((1, L, 49)),
         "aatype": np.concatenate([tokenize(c.sequence) for c in chains]),
-        "all_atom_positions": None,  # np.zeros((L, 37, 3)),
+        "all_atom_positions": np.zeros((L, 37, 3)),
         "seq_mask": np.ones(L),
         "msa_mask": np.ones((1, L)),
         "residue_index": index_within_chain,
@@ -363,11 +389,13 @@ def make_af_features(chains: list[TargetChain]) -> dict[str, jax.Array]:
 class AlphaFold2(StructurePredictionModel):
     af2_forward: callable
     stacked_parameters: PyTree
+    multimer: bool
 
-    def __init__(self, data_dir: str = "."):
-        (forward_function, stacked_params) = load_af2(data_dir=data_dir)
+    def __init__(self, data_dir: str = ".", multimer=True):
+        (forward_function, stacked_params) = load_af2(data_dir=data_dir, multimer=multimer)
         self.af2_forward = forward_function
         self.stacked_parameters = stacked_params
+        self.multimer = multimer
 
     def target_only_features(self, chains: list[TargetChain]):
         for c in chains:
@@ -405,20 +433,20 @@ class AlphaFold2(StructurePredictionModel):
         sampling_steps=None,
         model_idx: int | None = None,
         use_dropout: bool = False,
-        recycling_state: modules_multimer.AlphaFoldState | None = None,
+        recycling_state: state.AlphaFoldState | None = None,
         key,
     ):
-        features = set_binder_sequence(PSSM, features)
+        features = set_binder_sequence(PSSM, features, self.multimer)
         N = features["aatype"].shape[0]
 
         if model_idx is None:
-            model_idx = jax.random.randint(key=key, shape=(), minval=0, maxval=5)
+            model_idx = jax.random.randint(key=key, shape=(), minval=0, maxval=5 if self.multimer else 2)
             key = jax.random.fold_in(key, 0)
         else:
             model_idx = jax.device_put(model_idx)
 
         if recycling_state is None:
-            recycling_state = modules_multimer.AlphaFoldState(
+            recycling_state = state.AlphaFoldState(
                 prev_pos=jnp.zeros((N, residue_constants.atom_type_num, 3)),
                 prev_msa_first_row=jnp.zeros((N, 256)),
                 prev_pair=jnp.zeros((N, N, 128)),
@@ -427,7 +455,7 @@ class AlphaFold2(StructurePredictionModel):
         params = jax.tree.map(lambda v: v[model_idx], self.stacked_parameters)
 
         # recycling iterations
-        def body_fn(state: modules_multimer.AlphaFoldState, _):
+        def body_fn(state: state.AlphaFoldState, _):
             state = jax.tree.map(jax.lax.stop_gradient, state)
             output = self.af2_forward(
                 params,
@@ -457,7 +485,7 @@ class AlphaFold2(StructurePredictionModel):
         recycling_steps=1,
         model_idx: int | None = None,
         use_dropout: bool = False,
-        recycling_state: modules_multimer.AlphaFoldState | None = None,
+        recycling_state: state.AlphaFoldState | None = None,
         key,
     ):
         output = self.model_output(
@@ -487,7 +515,7 @@ class AlphaFold2(StructurePredictionModel):
         sampling_steps=None,
         model_idx: int | None = None,
         use_dropout: bool = False,
-        recycling_state: modules_multimer.AlphaFoldState | None = None,
+        recycling_state: state.AlphaFoldState | None = None,
         key,
     ) -> StructurePrediction:
         (afo, pae, plddt, iptm) = self._coords_and_confidences(
@@ -500,7 +528,7 @@ class AlphaFold2(StructurePredictionModel):
             recycling_state=recycling_state,
         )
 
-        _, structure = _postprocess_prediction(set_binder_sequence(PSSM, features), afo)
+        _, structure = _postprocess_prediction(set_binder_sequence(PSSM, features, self.multimer), afo)
 
         return StructurePrediction(st=structure, plddt=plddt, pae=pae, iptm=iptm)
 
@@ -511,14 +539,14 @@ class AlphaFoldLoss(LossTerm):
     features: dict
     loss: LinearCombination
     name: str
-    initial_state: modules_multimer.AlphaFoldState | None = None
+    initial_state: state.AlphaFoldState | None = None
     recycling_steps: int = 1
     use_dropout: bool = False
 
     def __call__(self, PSSM: Float[Array, "N 20"], *, key):
         # pick a random model
         
-        model_idx = jax.random.randint(key=key, shape=(), minval=0, maxval=5)
+        model_idx = jax.random.randint(key=key, shape=(), minval=0, maxval=5 if self.model.multimer else 2)
         key = jax.random.fold_in(key, 0)
         output = self.model.model_output(
             PSSM=PSSM,
