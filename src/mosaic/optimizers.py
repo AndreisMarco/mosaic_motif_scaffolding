@@ -75,45 +75,35 @@ def _eval_loss_and_grad(
     (v, aux), g = _____eval_loss_and_grad(loss_function, x=x, key=key)
     return (jnp.nan_to_num(v, nan = 1000000.0), aux), jnp.nan_to_num(g - g.mean(axis=-1, keepdims=True))
 
-
 # more underscores == more private
 @eqx.filter_jit
 def _____eval_loss_and_grad(loss, x, key):
     return eqx.filter_value_and_grad(loss, has_aux=True)(x, key=key)
 
-
 # this function is a mess, but it's used to update stateful loss functions. see comments in mosaic/common.py
 def update_states(aux, loss):
-    state_index_to_update = dict(
-        [
-            (int(x[0].id), x[1])
-            for x in jax.tree.leaves(aux, is_leaf=is_state_update)
-            if is_state_update(x)
-        ]
-    )
+    # Collect new_states and the id of their losses
+    state_index_to_update = [(x[0].id, x[1])
+                             for x in jax.tree.leaves(aux, is_leaf=is_state_update)
+                             if is_state_update(x)]
+    
+    # for multisample losses, as standard we only keep the first new generated state
+    state_index_to_update = {
+        (int(k.squeeze()) if isinstance(k, np.ndarray) else int(k)): 
+        (v[0] if isinstance(k, np.ndarray) else v)
+        for k, v in state_index_to_update
+        }
 
+    # get loss terms to update
     def get_modules_to_update(loss):
-        return tuple(
-            [
-                x
-                for x in jax.tree.leaves(loss, is_leaf=has_state_index)
-                if has_state_index(x)
-            ]
-        )
-
+        return tuple([x
+                      for x in jax.tree.leaves(loss, is_leaf=has_state_index)
+                      if has_state_index(x)])
+    # PyTree surgery to update states
     def replace_fn(module):
         return module.update_state(state_index_to_update[int(module.state_index.id)])
-
     return eqx.tree_at(get_modules_to_update, loss, replace_fn=replace_fn)
 
-
-# def _proposal(sequence, g, temp, alphabet_size: int = 20):
-#     input = jax.nn.one_hot(sequence, alphabet_size)
-#     g_i_x_i = (g * input).sum(-1, keepdims=True)
-#     logits = -((input * g).sum() - g_i_x_i + g) / temp
-#     return jax.nn.softmax(logits), jax.nn.log_softmax(logits)
-
-# rewrite in numpy to use float64
 from scipy.special import softmax, log_softmax 
 def _proposal(sequence, g, temp, alphabet_size: int = 20):
     input = np.eye(alphabet_size)[sequence]
