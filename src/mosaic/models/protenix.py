@@ -37,6 +37,7 @@ def load_model(name="protenix_mini_default_v0.5.0"):
 class Protenix(StructurePredictionModel):
     protenix: eqx.Module
     default_sample_steps: int
+    name: str
 
     def target_only_features(self, chains: list[TargetChain]):
         for c in chains:
@@ -72,6 +73,7 @@ class Protenix(StructurePredictionModel):
         initial_recycling_state=None,
     ):
         return self.build_multisample_loss(
+            name=self.name,
             loss=loss,
             features=features,
             recycling_steps=recycling_steps,
@@ -94,6 +96,7 @@ class Protenix(StructurePredictionModel):
         if sampling_steps is None:
             sampling_steps = self.default_sample_steps
         return MultiSampleProtenixLoss(
+            name=self.name,
             model=self.protenix,
             features=features,
             loss=loss,
@@ -191,16 +194,16 @@ class Protenix(StructurePredictionModel):
 
 
 def ProtenixMini():
-    return Protenix(load_model(name="protenix_mini_default_v0.5.0"), 2)
+    return Protenix(load_model(name="protenix_mini_default_v0.5.0"), 2, name="ProtenixMini")
 
 
 def ProtenixTiny():
-    return Protenix(load_model(name="protenix_tiny_default_v0.5.0"), 2)
+    return Protenix(load_model(name="protenix_tiny_default_v0.5.0"), 2, name="ProtenixTiny")
 
 
 def ProtenixBase():
-    return Protenix(load_model(name="protenix_base_default_v1.0.0"), 20)
+    return Protenix(load_model(name="protenix_base_default_v1.0.0"), 20, name="ProtenixBase")
 
 
 def Protenix2025():
-    return Protenix(load_model(name="protenix_base_20250630_v1.0.0"), 20)
+    return Protenix(load_model(name="protenix_base_20250630_v1.0.0"), 20, name="Protenix2025")

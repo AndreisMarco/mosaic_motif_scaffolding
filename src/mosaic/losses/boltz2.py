@@ -578,4 +578,4 @@ class MultiSampleBoltz2Loss(LossTerm):
             jax.random.split(key, self.num_samples)
         )
 
-        return self.reduction(vs), jax.tree.map(lambda v: list(jnp.sort(v)), auxs)
+        return self.reduction(vs),  {self.name: auxs}

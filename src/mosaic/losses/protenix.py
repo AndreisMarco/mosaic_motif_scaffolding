@@ -306,5 +306,4 @@ class MultiSampleProtenixLoss(LossTerm):
         vs, auxs = jax.vmap(apply_loss_to_single_sample)(
             jax.random.split(key, self.num_samples)
         )
-
-        return self.reduction(vs), jax.tree.map(lambda v: list(jnp.sort(v)), auxs)
+        return self.reduction(vs), {self.name: auxs}
