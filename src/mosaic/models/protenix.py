@@ -92,7 +92,13 @@ class Protenix(StructurePredictionModel):
         sampling_steps=None,
         reduction=jnp.mean,
         initial_recycling_state=None,
+        features_to_log: list[str] | None = None
     ):
+        if features_to_log is not None:
+            not_found = [f for f in features_to_log if f not in features.keys()]
+            if len(not_found) != 0: 
+                print(f"The following losses are not registered in the current model: {not_found}")
+        
         if sampling_steps is None:
             sampling_steps = self.default_sample_steps
         return MultiSampleProtenixLoss(
@@ -105,6 +111,7 @@ class Protenix(StructurePredictionModel):
             num_samples=num_samples,
             reduction=reduction,
             initial_recycling_state=initial_recycling_state,
+            features_to_log=features_to_log
         )
 
     def model_output(

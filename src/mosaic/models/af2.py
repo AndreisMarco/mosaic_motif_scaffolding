@@ -423,9 +423,24 @@ class AlphaFold2(StructurePredictionModel):
         return features, None
 
     def build_loss(
-        self, *, loss, features, recycling_steps=1, sampling_steps=None, name="af2", use_dropout=False, initial_state=None
-    ):
+        self, 
+        *, 
+        loss, 
+        features, 
+        recycling_steps=1, 
+        sampling_steps=None, 
+        name="af2", 
+        use_dropout=False, 
+        initial_state=None,
+        features_to_log=None
+        ):
         assert sampling_steps is None, "AF2 does not support sampling steps"
+
+        if features_to_log is not None:
+            not_found = [f for f in features_to_log if f not in features.keys()]
+            if len(not_found) != 0: 
+                print(f"The following losses are not registered in the current model: {not_found}")
+
         return AlphaFoldLoss(
             model=self,
             features=features,
@@ -434,6 +449,7 @@ class AlphaFold2(StructurePredictionModel):
             name=name,
             use_dropout=use_dropout,
             initial_state=initial_state,
+            features_to_log=features_to_log
         )
 
     def model_output(
@@ -554,10 +570,13 @@ class AlphaFoldLoss(LossTerm):
     initial_state: state.AlphaFoldState | None = None
     recycling_steps: int = 1
     use_dropout: bool = False
-
+    features_to_log: list[str] | None = None
+    '''
+        Args:
+        - features_to_log: a list of str corresponding to elements of the features dictionary, to add to the aux from the loss function. 
+    '''
     def __call__(self, PSSM: Float[Array, "N 20"], *, key):
         # pick a random model
-        
         model_idx = jax.random.randint(key=key, shape=(), minval=0, maxval=5 if self.model.multimer else 2)
         key = jax.random.fold_in(key, 0)
         output = self.model.model_output(
@@ -576,5 +595,16 @@ class AlphaFoldLoss(LossTerm):
             output=output,
             key=key,
         )
+
+        # Include any additional specified features
+        if self.features_to_log is None:
+            feature_dict = {}
+        else: 
+            feature_dict = {k: output.features[k] for k in self.features_to_log if k in output.features.keys()}
+        
+        auxs = {
+            "losses": auxs,
+            "features": feature_dict
+        }
 
         return v, {f"{self.name}/{model_idx}": aux}

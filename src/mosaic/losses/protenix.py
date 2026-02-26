@@ -264,11 +264,15 @@ class MultiSampleProtenixLoss(LossTerm):
     name: str = "protenix"
     initial_recycling_state: TrunkEmbedding | None = None
     reduction: any = jnp.mean
+    features_to_log: list[str] | None = None
 
     """
         Run the structure and confidence modules multiple times from the same trunk output.
         When `reduction` is jnp.mean this is equivalent to the expected loss over multiple samples *assuming a deterministic trunk*, but faster.
         This will consume quite a bit of memory -- if you'd like to sacrifice some speed for memory, replace the vmap below with a jax.lax.map.
+        
+        Args:
+        - features_to_log: a list of str corresponding to elements of the features dictionary, to add to the aux from the loss function. 
     """
 
     def __call__(self, sequence: Float[Array, "N 20"], key):
@@ -306,4 +310,16 @@ class MultiSampleProtenixLoss(LossTerm):
         vs, auxs = jax.vmap(apply_loss_to_single_sample)(
             jax.random.split(key, self.num_samples)
         )
+        
+        # Include any additional specified features
+        if self.features_to_log is None:
+            feature_dict = {}
+        else: 
+            feature_dict = {k: features[k] for k in self.features_to_log if k in features.keys()}
+        
+        auxs = {
+            "losses": auxs,
+            "features": feature_dict
+        }
+
         return self.reduction(vs), {self.name: auxs}

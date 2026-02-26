@@ -496,6 +496,12 @@ class Boltz1Loss(LossTerm):
     recycling_steps: int = 0
     sampling_steps: int = 25
     name: str = "boltz1"
+    features_to_log: list[str] | None = None
+
+    '''
+        Args:
+        - features_to_log: a list of str corresponding to elements of the features dictionary, to add to the aux from the loss function. 
+    '''
 
     def __call__(self, sequence: Float[Array, "N 20"], key=None):
         """Compute the loss for a given sequence."""
@@ -517,4 +523,15 @@ class Boltz1Loss(LossTerm):
             output=output,
             key=key,
         )
+
+        # Include any additional specified features
+        if self.features_to_log is None:
+            feature_dict = {}
+        else: 
+            feature_dict = {k: features[k] for k in self.features_to_log if k in features.keys()}
+        
+        auxs = {
+            "losses": auxs,
+            "features": feature_dict
+        }
         return v, {self.name: aux}
