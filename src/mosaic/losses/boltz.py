@@ -530,8 +530,8 @@ class Boltz1Loss(LossTerm):
         else: 
             feature_dict = {k: features[k] for k in self.features_to_log if k in features.keys()}
         
-        auxs = {
-            "losses": auxs,
+        aux = {
+            "losses": aux,
             "features": feature_dict
         }
         return v, {self.name: aux}

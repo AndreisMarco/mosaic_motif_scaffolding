@@ -602,8 +602,8 @@ class AlphaFoldLoss(LossTerm):
         else: 
             feature_dict = {k: output.features[k] for k in self.features_to_log if k in output.features.keys()}
         
-        auxs = {
-            "losses": auxs,
+        aux = {
+            "losses": aux,
             "features": feature_dict
         }
 
