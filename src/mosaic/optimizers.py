@@ -81,6 +81,7 @@ def _____eval_loss_and_grad(loss, x, key):
     return eqx.filter_value_and_grad(loss, has_aux=True)(x, key=key)
 
 # this function is a mess, but it's used to update stateful loss functions. see comments in mosaic/common.py
+# or explanation in mosaic/stateful_loss_explanation.ipynb
 def update_states(aux, loss):
     # Collect new_states and the id of their losses
     state_index_to_update = [(x[0].id, x[1])
