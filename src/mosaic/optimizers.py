@@ -4,31 +4,23 @@ import numpy as np
 import jax.numpy as jnp
 from jaxtyping import Array, Float, Int, PyTree
 from typing import Callable
-from mosaic.common import is_state_update, has_state_index, LossTerm, LinearCombination
+from mosaic.common import TOKENS, is_state_update, has_state_index, LossTerm, LinearCombination
+from abc import ABC, abstractmethod
 
 import time
 AbstractLoss = LossTerm | LinearCombination
 
-
-def _print_iter(iter, aux, v):
-    # first filter out anything that isn't a float or has number of dimensions > 0
-    aux = eqx.filter(
-        aux,
-        lambda v: isinstance(v, float | str) or v.shape == (),
-    )
-    print(
-        iter,
-        f"loss: {v:0.2f}",
-        " ".join(
-            f"{jax.tree_util.keystr(k, simple=True, separator='.')}:{v: 0.2f}"
-            for (k, v) in jax.tree_util.tree_leaves_with_path(aux)
-            if hasattr(v, "item")
-            or isinstance(v, float)
-            and (
-                "state_index" not in jax.tree_util.keystr(k, simple=True, separator=".")
-            )
-        ),
-    )
+def _print_iter(i, aux):
+    # Collect scalar-float leafs and their path
+    def is_scalar_float(x):
+        return isinstance(x, (float, jax.Array, np.ndarray)) and jnp.ndim(x) == 0
+    metrics = {
+        jax.tree_util.keystr(k, simple=True, separator='.'): float(v)
+        for k, v in jax.tree_util.tree_leaves_with_path(aux)
+        if is_scalar_float(v)
+        and "state_index" not in jax.tree_util.keystr(k, simple=True, separator=".")
+        }
+    print(i, " | ".join(f"{k:<5}: {v:>10.2f}" for k, v in metrics.items()))
 
 
 # Split this up so changing optim parameters doesn't trigger re-compilation of loss function
@@ -111,7 +103,6 @@ def _proposal(sequence, g, temp, alphabet_size: int = 20):
     g_i_x_i = (g * input).sum(-1, keepdims=True)
     logits = -((input * g).sum(-1, keepdims=True) - g_i_x_i + g) / temp
     return softmax(logits, axis=-1), log_softmax(logits, axis=-1)
-
 
 def gradient_MCMC(
     loss,
@@ -226,138 +217,190 @@ def gradient_MCMC(
 
     return sequence
 
+class TrajectoryLogger:
+    def __init__(self, is_leaf=None):
+        self.history = None
+        self.is_leaf = is_leaf or \
+                            (lambda x: isinstance(x, list) and not isinstance(x[0], dict))
 
-def projection_simplex(V, z=1):
-    """
-    From https://gist.github.com/mblondel/c99e575a5207c76a99d714e8c6e08e89
-    Projection of x onto the simplex, scaled by z:
-        P(x; z) = argmin_{y >= 0, sum(y) = z} ||y - x||^2
-    z: float or array
-        If array, len(z) must be compatible with V
-    """
-    V = np.array(V, dtype=np.float64)
-    n_features = V.shape[1]
-    U = np.sort(V, axis=1)[:, ::-1]
-    z = np.ones(len(V)) * z
-    cssv = np.cumsum(U, axis=1) - z[:, np.newaxis]
-    ind = np.arange(n_features) + 1
-    cond = U - cssv / ind > 0
-    rho = np.count_nonzero(cond, axis=1)
-    theta = cssv[np.arange(len(V)), rho - 1] / rho
-    return np.maximum(V - theta[:, np.newaxis], 0)
+    def _to_cpu(self, x):
+        if isinstance(x, (jax.Array, jnp.ndarray)):
+            return np.array(x)
+        return x
 
+    def update(self, aux):
+        # Initialize
+        if self.history is None:
+            self.history = jax.tree.map(lambda x: [self._to_cpu(x)], 
+                                         aux)
+        # Update
+        else:
+            self.history = jax.tree.map(lambda traj, new_value: traj + [self._to_cpu(new_value)], 
+                                        self.history, 
+                                        aux,
+                                        is_leaf=self.is_leaf)
+    def stack_arrays(self):
+        def _stack(lst):
+            try:
+                return np.stack(lst)
+            except (ValueError, TypeError):
+                return lst
+        return jax.tree_util.tree_map(_stack, 
+                                      self.history, 
+                                      is_leaf=self.is_leaf)    
 
-def simplex_APGM(
-    *,
-    loss_function,
-    x: Float[Array, "N 20"],
-    n_steps: int,
-    stepsize: float,
-    momentum: float = 0.0,
-    key=None,
-    max_gradient_norm: float | None = None,
-    update_loss_state: bool = False,
-    scale=1.0,
-    trajectory_fn: Callable[tuple[PyTree, Float[Array, "N 20"]], any] | None = None,
-    logspace: bool = False,
-    serial_evaluation: bool = False,
-    sample_loss: bool = False,
-):
-    """
-    Accelerated projected gradient descent on the simplex.
+class PSSMOptimizer(ABC):
+    def __init__(self,
+                loss_fn, 
+                n_steps: int = 50,
+                max_gradient_norm: float | None = None,
+                log_trajectory: bool = False,
+                update_loss_state: bool = False,
+                serial_evaluation: bool = False,
+                sample_loss: bool = False):
+        
+        # optimization settings
+        self.loss_fn = loss_fn
+        self.n_steps = n_steps
+        self.max_gradient_norm = max_gradient_norm
 
-    Args:
-    - loss_function: function to minimize
-    - x: initial sequence
-    - n_steps: number of optimization steps
-    - stepsize: step size for gradient descent
-    - momentum: momentum factor
-    - key: jax random key
-    - max_gradient_norm: maximum norm of the gradient
-    - update_loss_state: whether to update the loss function state
-    - scale: proximal scaling factor for L2 regularization (or entropic regularization if logspace=True), set to > 1.0 to encourage sparsity
-    - trajectory_fn: function to compute trajectory information, takes (aux, x) and returns any value.
-    - logspace: whether to optimize in log space, which corresponds to a bregman proximal algorithm.
+        # loss evaluation settings
+        self.update_loss_state = update_loss_state
+        self.serial_evaluation = serial_evaluation
+        self.sample_loss = sample_loss
 
-    returns:
-    - x: final soft sequence after optimization
-    - best_x: best soft sequence found during optimization
-    - trajectory: list of trajectory information if `trajectory_fn` is provided, otherwise nothing.
-    """
+        # logging settings
+        self.log_trajectory = log_trajectory
+        self.logger = TrajectoryLogger() if log_trajectory else None
 
-    if max_gradient_norm is None:
-        max_gradient_norm = np.sqrt(x.shape[0])
+    @abstractmethod
+    def step(self, state, key):
+        """
+        Optimizer specifc step 
+        """
+        pass
 
-    if key is None:
-        key = jax.random.key(np.random.randint(0, 10000))
+    def run(self, 
+            pssm_init: Float[Array, "N 20"],
+            key):
+        
+        best_loss = np.inf
+        state = {"x": pssm_init}
+        best_pssm = pssm_init
 
-    best_val = np.inf
-    x = projection_simplex(x) if not logspace else x
-    best_x = x
+        self.max_gradient_norm =  self.max_gradient_norm if self.max_gradient_norm is not None \
+                             else np.sqrt(pssm_init.shape[0]) # -_> potentially use a gradient fn from package or implement
 
-    x_prev = x
+        for i in range(self.n_steps):
+            start_time = time.time()
 
-    trajectory = []
+            # Optimizer specifc step
+            state, loss, aux = self.step(state, key)
+            key = jax.random.fold_in(key, 0)
 
-    for _iter in range(n_steps):
-        start_time = time.time()
-        v = jax.device_put(x + momentum * (x - x_prev))
-        (value, aux), g = _eval_loss_and_grad(
-            x=v if not logspace else jax.nn.softmax(v),
-            loss_function=loss_function,
+            # Update stateful losses
+            if self.update_loss_state:
+                self.loss_fn = update_states(aux, self.loss_fn)
+            
+            aux.update({"optim": {
+                "loss": loss, 
+                "nnz": (state["x"] > 0.01).sum(-1).mean(), 
+                "time": time.time() - start_time
+            }})
+
+            if self.log_trajectory:
+                self.logger.update(aux)
+
+            # Update best
+            if loss < best_loss and not np.isnan(loss):
+                best_pssm = state["x"]
+            # Log to terminal
+            _print_iter(i, aux)
+    
+        trajectory = self.logger.stack_arrays() if self.log_trajectory else None
+        final_pssm = state["x"]
+        return final_pssm, best_pssm, trajectory
+    
+class SimplexAPGM(PSSMOptimizer):
+    def __init__(self, stepsize, scale=1, momentum=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.stepsize = stepsize
+        self.momentum = momentum
+        self.scale = scale
+
+    @staticmethod
+    def _projection_simplex(V, z=1):
+        """
+        From https://gist.github.com/mblondel/c99e575a5207c76a99d714e8c6e08e89
+        Projection of x onto the simplex, scaled by z:
+            P(x; z) = argmin_{y >= 0, sum(y) = z} ||y - x||^2
+        z: float or array
+            If array, len(z) must be compatible with V
+        """
+        V = np.array(V, dtype=np.float64)
+        n_features = V.shape[1]
+        U = np.sort(V, axis=1)[:, ::-1]
+        z = np.ones(len(V)) * z
+        cssv = np.cumsum(U, axis=1) - z[:, np.newaxis]
+        ind = np.arange(n_features) + 1
+        cond = U - cssv / ind > 0
+        rho = np.count_nonzero(cond, axis=1)
+        theta = cssv[np.arange(len(V)), rho - 1] / rho
+        return np.maximum(V - theta[:, np.newaxis], 0)
+
+    def step(self, state, key):
+        x = self._projection_simplex(state["x"])
+        x_prev = state["x_prev"] if "x_prev" in state.keys() else state["x"] 
+        v = jax.device_put(x + self.momentum * (x - x_prev))
+
+        (loss, aux), g = _eval_loss_and_grad(
+            x=v,
+            loss_function=self.loss_fn,
             key=key,
-            serial_evaluation=serial_evaluation,
-            sample_loss=sample_loss,
+            serial_evaluation=self.serial_evaluation,
+            sample_loss=self.sample_loss,
         )
 
         n = np.sqrt((g**2).sum())
-        if n > max_gradient_norm:
-            g = g * (max_gradient_norm / n)
+        if n > self.max_gradient_norm:
+            g = g * (self.max_gradient_norm / n)
+        
+        state["x"] = self._projection_simplex(self.scale * (v - self.stepsize * g))
+        state["x_prev"] = x
 
-        key = jax.random.fold_in(key, 0)
+        return state, loss, aux
 
-        if logspace:
-            x_new = scale * (v - stepsize * g)
-        else:
-            x_new = projection_simplex(scale * (v - stepsize * g))
+class LogitAPGM(PSSMOptimizer):
+    def __init__(self, stepsize, scale=1.0, momentum=0.0, **kwargs):
+        super().__init__(**kwargs)
+        self.stepsize = stepsize
+        self.momentum = momentum
+        self.scale = scale
 
-        x_prev = x
-        x = x_new
-
-        if value < best_val and not np.isnan(value):
-            best_val = value
-            best_x = (
-                x  # this isn't exactly right, because we evaluated loss at v, not x.
-            )
-
-        average_nnz = (
-            (x > 0.01).sum(-1).mean()
-            if not logspace
-            else (jax.nn.softmax(x) > 0.01).sum(-1).mean()
+    def step(self, state, key):
+        if "x_logit" not in state: 
+            state["x_logit"] = jax.nn.log_softmax(state["x"], axis=-1) 
+            state["x_prev_logit"] = state["x_logit"]
+        x_logit = state["x_logit"]
+        x_prev_logit = state["x_prev_logit"]
+        
+        v = jax.device_put(x_logit + self.momentum * (x_logit - x_prev_logit))
+        (loss, aux), g = _eval_loss_and_grad(
+            x=softmax(v, axis=-1),
+            loss_function=self.loss_fn,
+            key=key,
+            serial_evaluation=self.serial_evaluation,
+            sample_loss=self.sample_loss,
         )
 
-        # add loss and NNZ to aux
-        if update_loss_state:
-            loss_function = update_states(aux, loss_function)
+        n = np.sqrt((g**2).sum())
+        if n > self.max_gradient_norm:
+            g = g * (self.max_gradient_norm / n)
+        
+        state["x_logit"] = self.scale * (v - self.stepsize * g) 
+        state["x"] = softmax(state["x_logit"], axis=-1)
+        state["x_prev_logit"] = x_logit
 
-        aux = {"loss": value, "nnz": average_nnz, "time": (time.time()-start_time), "": aux}
-        if trajectory_fn is not None:
-            trajectory.append(trajectory_fn(aux, x))
+        return state, loss, aux
 
-        _print_iter(
-            _iter,
-            eqx.filter(
-                aux,
-                lambda v: isinstance(v, float) or v.shape == (),
-            ),
-            value,
-        )
 
-    if logspace:
-        x = jax.nn.softmax(x)
-        best_x = jax.nn.softmax(best_x)
-
-    if trajectory_fn is None:
-        return x, best_x
-    else:
-        return x, best_x, trajectory
