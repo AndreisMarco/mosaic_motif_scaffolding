@@ -276,11 +276,11 @@ def aux_to_wandb(aux):
         parts = [str(p.key) for p in path if hasattr(p, "key")]
         path_str = ".".join(parts) if parts else "value"
         if "losses" in path_str and isinstance(leaf, (np.ndarray, jnp.ndarray)):
-            log[path_str] = np.mean(leaf)
+                   log[path_str] = float(np.mean(leaf))
         elif "pssm" in path_str:
             log[path_str] = pssm_heatmap(leaf, return_wandb_image=True)
-        else:
-            log[path_str] = leaf            
+        elif leaf.dim == 0 or isinstance(leaf, (float, int)):
+            log[path_str] = float(leaf)            
     return log
 
 class PSSMOptimizer(ABC):
