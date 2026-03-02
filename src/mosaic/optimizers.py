@@ -2,12 +2,13 @@ import equinox as eqx
 import jax
 import numpy as np
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int, PyTree
-from typing import Callable
+from jaxtyping import Array, Float, Int
 from mosaic.common import TOKENS, is_state_update, has_state_index, LossTerm, LinearCombination
 from abc import ABC, abstractmethod
-
+import wandb
+import matplotlib.pyplot as plt
 import time
+
 AbstractLoss = LossTerm | LinearCombination
 
 def _print_iter(i, aux):
@@ -247,18 +248,52 @@ class TrajectoryLogger:
                 return lst
         return jax.tree_util.tree_map(_stack, 
                                       self.history, 
-                                      is_leaf=self.is_leaf)    
+                                      is_leaf=self.is_leaf)   
+
+def pssm_heatmap(pssm, return_wandb_image: bool = False):
+    seq_len = pssm.shape[0]
+    aa_labels = list(TOKENS)
+
+    # Heatmap
+    fig, ax = plt.subplots(1,1, figsize=(4, 12))
+    ax.imshow(pssm, aspect="auto", cmap='Greys', vmin=0, vmax=1)
+    ax.set_title(f"PSSM")
+    ax.set_xticks(np.arange(len(aa_labels)))
+    ax.set_xticklabels(aa_labels)
+    ax.set_yticks(np.arange(0, seq_len, 10))
+    fig.tight_layout()
+    if return_wandb_image:
+        wandb_image = wandb.Image(fig)
+        plt.close(fig)
+        return wandb_image
+    else:
+        return fig # never used ATM
+
+def aux_to_wandb(aux):
+    log = {}
+    for path, leaf in jax.tree_util.tree_leaves_with_path(aux):
+        # build path removing the sequence indexes
+        parts = [str(p.key) for p in path if hasattr(p, "key")]
+        path_str = ".".join(parts) if parts else "value"
+        if "losses" in path_str and isinstance(leaf, (np.ndarray, jnp.ndarray)):
+            log[path_str] = np.mean(leaf)
+        elif "pssm" in path_str:
+            log[path_str] = pssm_heatmap(leaf, return_wandb_image=True)
+        else:
+            log[path_str] = leaf            
+    return log
 
 class PSSMOptimizer(ABC):
     def __init__(self,
                 loss_fn, 
                 n_steps: int = 50,
                 max_gradient_norm: float | None = None,
-                log_trajectory: bool = False,
+                log_trajectory: bool = True,
                 update_loss_state: bool = False,
                 serial_evaluation: bool = False,
-                sample_loss: bool = False):
-        
+                sample_loss: bool = False,
+                use_wandb: bool = False):
+
         # optimization settings
         self.loss_fn = loss_fn
         self.n_steps = n_steps
@@ -272,6 +307,7 @@ class PSSMOptimizer(ABC):
         # logging settings
         self.log_trajectory = log_trajectory
         self.logger = TrajectoryLogger() if log_trajectory else None
+        self.use_wandb = use_wandb
 
     @abstractmethod
     def step(self, state, key):
@@ -282,21 +318,30 @@ class PSSMOptimizer(ABC):
 
     def run(self, 
             pssm_init: Float[Array, "N 20"],
-            key):
+            key,
+            wandb_project: str = "pssm_optimization"):
+        
+        if self.use_wandb: 
+            wandb.login()
+            config = {k: v for k, v in vars(self).items() if isinstance(v, (int, float, str, bool))}
+            wandb.init(
+                project=wandb_project, 
+                config=config
+                )
         
         best_loss = np.inf
         state = {"x": pssm_init}
         best_pssm = pssm_init
 
         self.max_gradient_norm =  self.max_gradient_norm if self.max_gradient_norm is not None \
-                             else np.sqrt(pssm_init.shape[0]) # -_> potentially use a gradient fn from package or implement
+                                                         else np.sqrt(pssm_init.shape[0])
 
         for i in range(self.n_steps):
             start_time = time.time()
 
             # Optimizer specifc step
             state, loss, aux = self.step(state, key)
-            key = jax.random.fold_in(key, 0)
+            key = jax.random.fold_in(key, i)
 
             # Update stateful losses
             if self.update_loss_state:
@@ -305,11 +350,15 @@ class PSSMOptimizer(ABC):
             aux.update({"optim": {
                 "loss": loss, 
                 "nnz": (state["x"] > 0.01).sum(-1).mean(), 
-                "time": time.time() - start_time
+                "time": time.time() - start_time,
+                "pssm": state["x"], 
             }})
 
             if self.log_trajectory:
                 self.logger.update(aux)
+
+            if self.use_wandb:
+                wandb.log(aux_to_wandb(aux))
 
             # Update best
             if loss < best_loss and not np.isnan(loss):
@@ -317,6 +366,9 @@ class PSSMOptimizer(ABC):
             # Log to terminal
             _print_iter(i, aux)
     
+        if self.use_wandb:
+                wandb.finish()
+
         trajectory = self.logger.stack_arrays() if self.log_trajectory else None
         final_pssm = state["x"]
         return final_pssm, best_pssm, trajectory
