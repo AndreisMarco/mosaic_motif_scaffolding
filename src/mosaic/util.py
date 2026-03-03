@@ -70,6 +70,14 @@ def kabsch(
 
     return R, t
 
+def gram_schmidt(v1: jnp.ndarray, v2: jnp.ndarray) -> jnp.ndarray:
+    e1 = v1 / jnp.linalg.norm(v1, axis=-1, keepdims=True)
+    e2_raw = v2 - jnp.sum(v2 * e1, axis=-1, keepdims=True) * e1
+    e2 = e2_raw / jnp.linalg.norm(e2_raw, axis=-1, keepdims=True)
+    e3 = jnp.cross(e1, e2)
+    return jnp.stack([e1, e2, e3], axis=-1)
+
+
 def unaligned_rmsd(
     P: Float[Array, "N 3"], Q: Float[Array, "M 3"]
 ):

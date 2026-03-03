@@ -5,6 +5,12 @@ import numpy as np
 
 TOKENS = "ARNDCQEGHILKMFPSTWYV"
 
+restype_three_to_one = {
+    "ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C",
+    "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I",
+    "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P",
+    "SER": "S", "THR": "T", "TRP": "W", "TYR": "Y", "VAL": "V",
+}
 
 def tokenize(sequence: str) -> np.ndarray:
     return np.array([TOKENS.index(s) for s in sequence], dtype=np.int32)
