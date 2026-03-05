@@ -2,7 +2,7 @@ import equinox as eqx
 import jax
 import numpy as np
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int
+from jaxtyping import Array, Float, Int, Bool
 from mosaic.common import TOKENS, is_state_update, has_state_index, LossTerm, LinearCombination
 from abc import ABC, abstractmethod
 import wandb
@@ -319,6 +319,7 @@ class PSSMOptimizer(ABC):
     def run(self, 
             pssm_init: Float[Array, "N 20"],
             key,
+            update_mask: Bool[Array, "N"] | None = None, 
             wandb_project: str = "pssm_optimization"):
         
         if self.use_wandb: 
@@ -329,8 +330,14 @@ class PSSMOptimizer(ABC):
                 config=config
                 )
         
+        if update_mask is None:
+            update_mask = jnp.ones(shape=(pssm_init.shape[0]), dtype=Bool)
+        
         best_loss = np.inf
-        state = {"x": pssm_init}
+        state = {
+            "x": pssm_init,
+            "mask": update_mask
+            }
         best_pssm = pssm_init
 
         self.max_gradient_norm =  self.max_gradient_norm if self.max_gradient_norm is not None \
@@ -417,6 +424,7 @@ class SimplexAPGM(PSSMOptimizer):
         if n > self.max_gradient_norm:
             g = g * (self.max_gradient_norm / n)
         
+        g = g * state["mask"][:, None]
         state["x"] = self._projection_simplex(self.scale * (v - self.stepsize * g))
         state["x_prev"] = x
 
@@ -448,7 +456,8 @@ class LogitAPGM(PSSMOptimizer):
         n = np.sqrt((g**2).sum())
         if n > self.max_gradient_norm:
             g = g * (self.max_gradient_norm / n)
-        
+
+        g = g * state["mask"][:, None]
         state["x_logit"] = self.scale * (v - self.stepsize * g) 
         state["x"] = softmax(state["x_logit"], axis=-1)
         state["x_prev_logit"] = x_logit
